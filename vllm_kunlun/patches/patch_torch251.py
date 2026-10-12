@@ -538,6 +538,118 @@ __all__ = [
             'indices=index_tensor, backend="torch_native")'
         ),
     },
+    # ----------------------------------------------------------
+    # Patch 11: backends.py — Wrap the eagle drafter's subgraphs
+    #           with a PIECEWISE cudagraph wrapper
+    # ----------------------------------------------------------
+    {
+        "file": "vllm/compilation/backends.py",
+        "desc": (
+            "The PIECEWISE cudagraph wrap decision is made at compile time "
+            "from the main model's cudagraph_mode, but the GDN attention "
+            "backend downgrades FULL to FULL_AND_PIECEWISE only after the MTP "
+            "eagle drafter has been compiled, and nothing re-wraps already "
+            "compiled subgraphs. The drafter then dispatches PIECEWISE into "
+            "subgraphs that have no wrapper and never replay, paying full "
+            "per-kernel host launch cost twice per decode step. Decide the "
+            "drafter's wrapping from the drafter's own mode instead: only "
+            "subgraphs whose VllmBackend.prefix is 'eagle_head' gain a "
+            "wrapper, the backbone keeps its current behaviour."
+        ),
+        "lines": "406-431",
+        "old": '''\
+def wrap_with_cudagraph_if_needed(
+    piecewise_backend: Any,
+    vllm_config: VllmConfig,
+    compilation_config: CompilationConfig,
+    is_first_graph: bool,
+    is_last_graph: bool,
+) -> Any:
+    """
+    Wrap a piecewise backend with CUDA graph wrapper if needed.
+    This function is shared between VllmBackend and
+    construct_serializable_fn_from_inductor_cache.
+
+    Args:
+        piecewise_backend: The backend to wrap
+        vllm_config: The vLLM configuration
+        compilation_config: The compilation configuration
+        is_first_graph: Whether this is the first graph in the sequence
+        is_last_graph: Whether this is the last graph in the sequence
+
+    Returns:
+        The wrapped backend if CUDA graphs are enabled, otherwise the original backend
+    """
+    if (
+        not compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+        or compilation_config.use_inductor_graph_partition
+    ):
+        return piecewise_backend''',
+        "new": '''\
+def _needs_piecewise_cudagraph_wrapper(
+    piecewise_backend: Any,
+    vllm_config: VllmConfig,
+    compilation_config: CompilationConfig,
+) -> bool:
+    """Whether this subgraph needs a PIECEWISE cudagraph wrapper.
+
+    Wrapping is decided while the subgraph is being compiled, but
+    `cudagraph_mode` can still be downgraded afterwards: the GDN attention
+    backend rejects FULL in `_check_and_update_cudagraph_mode` and switches to
+    FULL_AND_PIECEWISE, which happens after the drafter has been compiled, and
+    nothing re-wraps already compiled subgraphs.
+
+    `EagleProposer.initialize_cudagraph_keys` picks PIECEWISE whenever the main
+    model's mixed mode is PIECEWISE or FULL, so the drafter dispatches PIECEWISE
+    either way.  Without a wrapper that dispatch silently never replays and every
+    draft forward pays full host launch cost, so decide the drafter's wrapping
+    from the drafter's own mode rather than from the main model's.
+    """
+    if compilation_config.cudagraph_mode.has_piecewise_cudagraphs():
+        return True
+
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or speculative_config.enforce_eager:
+        return False
+    if compilation_config.cudagraph_mode.mixed_mode() not in (
+        CUDAGraphMode.PIECEWISE,
+        CUDAGraphMode.FULL,
+    ):
+        return False
+    vllm_backend = getattr(piecewise_backend, "vllm_backend", None)
+    return getattr(vllm_backend, "prefix", None) == "eagle_head"
+
+
+def wrap_with_cudagraph_if_needed(
+    piecewise_backend: Any,
+    vllm_config: VllmConfig,
+    compilation_config: CompilationConfig,
+    is_first_graph: bool,
+    is_last_graph: bool,
+) -> Any:
+    """
+    Wrap a piecewise backend with CUDA graph wrapper if needed.
+    This function is shared between VllmBackend and
+    construct_serializable_fn_from_inductor_cache.
+
+    Args:
+        piecewise_backend: The backend to wrap
+        vllm_config: The vLLM configuration
+        compilation_config: The compilation configuration
+        is_first_graph: Whether this is the first graph in the sequence
+        is_last_graph: Whether this is the last graph in the sequence
+
+    Returns:
+        The wrapped backend if CUDA graphs are enabled, otherwise the original backend
+    """
+    if (
+        not _needs_piecewise_cudagraph_wrapper(
+            piecewise_backend, vllm_config, compilation_config
+        )
+        or compilation_config.use_inductor_graph_partition
+    ):
+        return piecewise_backend''',
+    },
 ]
 
 
